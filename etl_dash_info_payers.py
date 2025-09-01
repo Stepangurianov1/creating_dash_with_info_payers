@@ -71,9 +71,11 @@ def get_invoice_data_by_days(start_date: str, end_date: str):
                 cl.system_name as currency,
                 oi.amount, 
                 case when oi.engine_id is null then 0 else 1 end as banking_details_issued,
-                oi.created_at
+                oi.created_at,
+                c.name as client_name
             from orders.invoice oi
             join lists.currency_list cl on cl.id = oi.currency_id
+            join clients.client c on c.id = oi.client_id
             where oi.created_at >= '{day_start}' and oi.created_at <= '{day_end}'
             """
             daily_data = pd.read_sql(text(query), get_engine())
@@ -101,7 +103,7 @@ def update_db():
     metrics_success_banking = (
         invoice_data[invoice_data['banking_details_issued'] == 1]
         .assign(amount_success=lambda d: d['amount'].where(d['status_id'] == 2, 0))
-        .groupby(['payer_id', 'currency'])
+        .groupby(['payer_id', 'currency', 'client_name'])
         .agg(
             total_orders=('order_id', 'count'),
             success_orders=('status_id', lambda s: (s == 2).sum()),
@@ -111,9 +113,9 @@ def update_db():
         .assign(conversion_payment=lambda x: (x['success_orders']/x['total_orders']).round(2))
         .reset_index()
         .merge(invoice_data
-                    .groupby(['payer_id', 'currency'])
+                    .groupby(['payer_id', 'currency', 'client_name'])
                     .agg(conversion_issued=('banking_details_issued', 'mean'))
-                    .reset_index(), on=['payer_id', 'currency'], how='inner'
+                    .reset_index(), on=['payer_id', 'currency', 'client_name'], how='inner'
                 )
         .sort_values('success_orders', ascending=False)
     )

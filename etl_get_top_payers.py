@@ -2,6 +2,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine
 from sqlalchemy import text
+import IP2Location
+import ipaddress
 
 
 

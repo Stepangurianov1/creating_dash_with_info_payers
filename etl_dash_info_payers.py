@@ -127,6 +127,7 @@ def create_query(start_date: str, end_date: str, payer_values: str):
                 MIN(created_at)                                    AS first_order_date
             FROM u
             GROUP BY payer_id, currency, client_name, order_type
+            HAVING SUM((is_success)::int) > 1
             ORDER BY success_orders DESC;
             """
 
@@ -156,7 +157,7 @@ def get_payers_by_tickets(orders_ids):
     """
 
 def get_data_by_days(start_date: str, end_date: str):
-    top_payers = pd.read_sql(text("select * from cascade.top_payers"), get_engine_dwh())
+    top_payers = pd.read_sql(text("select payer_id from cascade.top_payers"), get_engine_dwh())
     try:
         start = safe_parse_date(start_date)
         end = safe_parse_date(end_date)
@@ -171,7 +172,7 @@ def get_data_by_days(start_date: str, end_date: str):
     day_counter = 1
     while current_date <= end:
         window_start_dt = current_date
-        window_end_dt = min(current_date + timedelta(days=6), end)
+        window_end_dt = min(current_date + timedelta(days=4), end)
         window_start = window_start_dt.strftime('%Y-%m-%d 00:00:00')
         window_end = window_end_dt.strftime('%Y-%m-%d 23:59:59')
         
@@ -268,29 +269,29 @@ def get_data_by_days(start_date: str, end_date: str):
                 print(f"Ошибка при получении данных за {current_date.strftime('%Y-%m-%d')}: {e}")
                 break
 
-        current_date += timedelta(days=7)
+        current_date += timedelta(days=5)
         day_counter += 1
         time.sleep(0.5)
     return final_df
 
 def update_db():
-    start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    start_date = datetime(datetime.now().year, 1, 1).strftime('%Y-%m-%d')
     end_date = datetime.now().strftime('%Y-%m-%d')
     data = get_data_by_days(start_date, end_date)
     metrics_success_banking = (
     data.groupby(['payer_id', 'currency', 'client_name', 'order_type'])
-    .agg(
-        total_orders=('total_orders', 'sum'),
-        success_orders=('success_orders', 'sum'),
-        amount_success=('amount_success', 'sum'),
-        banking_details_issued_count=('banking_details_issued_count', 'sum'),
-        last_order_date=('last_order_date', 'max'),
-        first_order_date=('first_order_date', 'min'),
-        tickets_count=('tickets_count', 'sum'),
-        count_rejected_tickets=('count_rejected_tickets', 'sum')
+        .agg(
+            total_orders=('total_orders', 'sum'),
+            success_orders=('success_orders', 'sum'),
+            amount_success=('amount_success', 'sum'),
+            banking_details_issued_count=('banking_details_issued_count', 'sum'),
+            last_order_date=('last_order_date', 'max'),
+            first_order_date=('first_order_date', 'min'),
+            tickets_count=('tickets_count', 'sum'),
+            count_rejected_tickets=('count_rejected_tickets', 'sum')
+        )
+        .reset_index()
     )
-    .reset_index()
-)
     metrics_success_banking['conversion_payment'] = (
         metrics_success_banking['success_orders'] / metrics_success_banking['banking_details_issued_count']
     )

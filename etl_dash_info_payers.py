@@ -72,7 +72,7 @@ def get_query_tickets(start_date: str, end_date: str):
         where created_at >= '{start_date}' and created_at <= '{end_date}'
     """
 
-def create_query(start_date: str, end_date: str):
+def create_query(start_date: str, end_date: str, payer_values: str):
     return f"""
             WITH payin AS (
                 SELECT
@@ -88,6 +88,7 @@ def create_query(start_date: str, end_date: str):
                 FROM orders.invoice oi
                 JOIN lists.currency_list cl ON cl.id = oi.currency_id
                 JOIN clients.client c       ON c.id = oi.client_id
+                JOIN unnest(ARRAY{payer_values}::text[]) AS tp(payer_id) ON tp.payer_id = oi.payer_id::text
                 WHERE oi.created_at >= '{start_date}' and oi.created_at <= '{end_date}'
             ),
             payout AS (
@@ -104,6 +105,7 @@ def create_query(start_date: str, end_date: str):
                 FROM orders.withdraw w
                 JOIN lists.currency_list cl ON cl.id = w.currency_id
                 JOIN clients.client c       ON c.id = w.client_id
+                JOIN unnest(ARRAY{payer_values}::text[]) AS tp(payer_id) ON tp.payer_id = (w.extra->'payerInfo'->>'userID')::text
                 WHERE (w.extra->'payerInfo'->>'userID') IS NOT NULL
                 AND w.created_at >= '{start_date}' and w.created_at <= '{end_date}'
             ),
@@ -169,25 +171,60 @@ def get_data_by_days(start_date: str, end_date: str):
     day_counter = 1
     while current_date <= end:
         window_start_dt = current_date
-        window_end_dt = min(current_date + timedelta(days=1), end)
+        window_end_dt = min(current_date + timedelta(days=6), end)
         window_start = window_start_dt.strftime('%Y-%m-%d 00:00:00')
         window_end = window_end_dt.strftime('%Y-%m-%d 23:59:59')
-        print(f"Дата с {window_start} по {window_end}")
         
         attempts = 0
         max_retries = 2
         backoff_sec = 2
         while True:
             try:
-                query = create_query(window_start, window_end)
-                start_time = time.time()
-                daily_data = pd.read_sql(text(query), get_engine())
+                print(f"Дата с {window_start} по {window_end}")
+                payer_ids = top_payers['payer_id'].astype(str).tolist()
+                chunk_size = 20_000
+                chunked_frames = []
+                start_time_general = time.time()
+                for i in range(0, len(payer_ids), chunk_size):
+                    chunk = payer_ids[i:i+chunk_size]
+                    payer_values = '[' + ','.join([f"'{pid}'" for pid in chunk]) + ']'
+                    query = create_query(window_start, window_end, payer_values)
+                    start_time_payers = time.time()
+                    time.sleep(0.5)
+                    part = pd.read_sql(text(query), get_engine())
+                    end_time_payers = time.time()
+                    print(f"Выгузили payers chunk {i//chunk_size+1} ({len(chunk)} ids) - {end_time_payers - start_time_payers}")
+                    if not part.empty:
+                        chunked_frames.append(part)
+                if chunked_frames:
+                    daily_data = pd.concat(chunked_frames, ignore_index=True)
+                    daily_data = (
+                        daily_data
+                        .groupby(['payer_id', 'currency', 'client_name', 'order_type'], as_index=False)
+                        .agg(
+                            total_orders=('total_orders', 'sum'),
+                            success_orders=('success_orders', 'sum'),
+                            amount_success=('amount_success', 'sum'),
+                            banking_details_issued_count=('banking_details_issued_count', 'sum'),
+                            last_order_date=('last_order_date', 'max'),
+                            first_order_date=('first_order_date', 'min'),
+                        )
+                    )
+                else:
+                    daily_data = pd.DataFrame()
+                print(f"Итого daily_data по окну: {len(daily_data)}")
 
                 query_tickets = get_query_tickets(window_start, window_end)
+                start_time_tickets = time.time()
                 tickets_data = pd.read_sql(text(query_tickets), get_engine_tickets())
+                end_time_tickets = time.time()
+                print(f"Выгузили tickets - {end_time_tickets - start_time_tickets}")
 
                 query_get_payers_by_tickets = get_payers_by_tickets(tickets_data['order_id'].tolist())
+                start_time_payers_by_tickets = time.time()
                 payers_by_tickets = pd.read_sql(text(query_get_payers_by_tickets), get_engine())
+                end_time_payers_by_tickets = time.time()
+                print(f"Выгузили payers_by_tickets - {end_time_payers_by_tickets - start_time_payers_by_tickets}")
 
                 tickets_data['order_id'] = tickets_data['order_id'].astype(str)
                 payers_by_tickets['order_id'] = payers_by_tickets['order_id'].astype(str)
@@ -210,7 +247,7 @@ def get_data_by_days(start_date: str, end_date: str):
                 )
                 print(f"Размер daily_data - {len(daily_data)}")
                 end_time = time.time()
-                print("Выгузили - ", end_time - start_time)
+                print("Выгузили - ", end_time - start_time_general)
                 daily_data = daily_data.merge(top_payers, on='payer_id')
                 if not daily_data.empty:
                     final_df = pd.concat([final_df, daily_data], ignore_index=True)
@@ -231,7 +268,7 @@ def get_data_by_days(start_date: str, end_date: str):
                 print(f"Ошибка при получении данных за {current_date.strftime('%Y-%m-%d')}: {e}")
                 break
 
-        current_date += timedelta(days=2)
+        current_date += timedelta(days=7)
         day_counter += 1
         time.sleep(0.5)
     return final_df

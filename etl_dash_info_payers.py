@@ -8,40 +8,78 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 warnings.filterwarnings('ignore')
 
+SRC_DB_CONFIG = {
+    'host': '138.68.88.175',
+    'port': 5432,
+    'database': 'csd_bi',
+    'user': 'datalens_utl',
+    'password': 'mQnXQaHP6zkOaFdTLRVLx40gT4'
+}
+TICKETS_DB_CONFIG = {
+    'host': '138.68.88.175',
+    'port': 5416,
+    'database': 'ticket_replica',
+    'user': 'klaksik77',
+    'password': '6g3u0k13GhPhC2fvvPO'
+}
+DWH_DB_CONFIG = {
+    'host': 'primarydwhcsd.aerxd.tech',
+    'port': 6432,
+    'database': 'postgres',
+    'user': 'ste',
+    'password': 'ILzAYQ72aEe9'
+}
 
-def get_engine():
-    db_config = {
-        'host': '138.68.88.175',
-        'port': 5432,
-        'database': 'csd_bi',
-        'user': 'datalens_utl',
-        'password': 'mQnXQaHP6zkOaFdTLRVLx40gT4'
+def _make_engine(db, include_options: bool = True):
+    conn = f"postgresql+psycopg2://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['database']}"
+    connect_args = {
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
     }
+    if include_options:
+        connect_args["options"] = "-c statement_timeout=600000"
+    return create_engine(
+        conn,
+        pool_pre_ping=True,
+        pool_recycle=180,
+        pool_size=5,
+        max_overflow=2,
+        connect_args=connect_args,
+    )
 
-    connection_string = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-    return create_engine(connection_string, pool_pre_ping=True)
+ENGINE_SRC = _make_engine(SRC_DB_CONFIG, include_options=True)
+ENGINE_TICKETS = _make_engine(TICKETS_DB_CONFIG, include_options=True)
+ENGINE_DWH = _make_engine(DWH_DB_CONFIG, include_options=False)
 
-def get_engine_tickets():
-    db_config = {
-        'host': '138.68.88.175',
-        'port': 5416,
-        'database': 'ticket_replica',
-        'user': 'klaksik77',
-        'password': '6g3u0k13GhPhC2fvvPO'
-    }
-    connection_string = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-    return create_engine(connection_string, pool_pre_ping=True)
 
-def get_engine_dwh():
-    db_config = {
-        'host': 'primarydwhcsd.aerxd.tech',
-        'port': 6432,
-        'database': 'postgres',
-        'user': 'ste',
-        'password': 'ILzAYQ72aEe9'
-    }
-    connection_string = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-    return create_engine(connection_string, pool_pre_ping=True)
+def read_sql_retry_engine(engine, sql, params=None, retries: int = 3):
+    for attempt in range(retries):
+        try:
+            with engine.connect() as conn:
+                query = text(sql) if isinstance(sql, str) else sql
+                return pd.read_sql(query, conn, params=params)
+        except OperationalError as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
+def log_sql_failure(sql: str, err: Exception, chunk_idx: int, window_start: str, window_end: str, limit: int = 10000):
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    fname = f"failed_sql_{ts}_chunk{chunk_idx}_{window_start[:10]}_{window_end[:10]}.log"
+    try:
+        with open(fname, 'w') as f:
+            f.write("ERROR:\n")
+            f.write(str(err))
+            f.write("\n\nSQL (first N chars):\n")
+            f.write(sql[:limit])
+        print(f"Saved failing SQL to: {fname}")
+    except Exception:
+        pass
+
 
 def safe_parse_date(date_str):
     """Пытается создать дату, если день превышает допустимое — сдвигает на последний день месяца."""
@@ -127,7 +165,6 @@ def create_query(start_date: str, end_date: str, payer_values: str):
                 MIN(created_at)                                    AS first_order_date
             FROM u
             GROUP BY payer_id, currency, client_name, order_type
-            HAVING SUM((is_success)::int) > 1
             ORDER BY success_orders DESC;
             """
 
@@ -157,13 +194,13 @@ def get_payers_by_tickets(orders_ids):
     """
 
 def get_data_by_days(start_date: str, end_date: str):
-    top_payers = pd.read_sql(text("select payer_id from cascade.top_payers"), get_engine_dwh())
-    try:
-        start = safe_parse_date(start_date)
-        end = safe_parse_date(end_date)
-    except Exception as e:
-        print(e)
-        return pd.DataFrame()
+    top_payers = read_sql_retry_engine(ENGINE_DWH, text("select payer_id from cascade.top_payers"))
+    # try:
+    start = safe_parse_date(start_date)
+    end = safe_parse_date(end_date)
+    # except Exception as e:
+    #     print(e)
+    #     return pd.DataFrame()
     if start > end:
         return pd.DataFrame()
 
@@ -172,110 +209,103 @@ def get_data_by_days(start_date: str, end_date: str):
     day_counter = 1
     while current_date <= end:
         window_start_dt = current_date
-        window_end_dt = min(current_date + timedelta(days=4), end)
+        window_end_dt = min(current_date + timedelta(days=6), end)
         window_start = window_start_dt.strftime('%Y-%m-%d 00:00:00')
         window_end = window_end_dt.strftime('%Y-%m-%d 23:59:59')
-        
-        attempts = 0
-        max_retries = 2
-        backoff_sec = 2
-        while True:
-            try:
-                print(f"Дата с {window_start} по {window_end}")
-                payer_ids = top_payers['payer_id'].astype(str).tolist()
-                chunk_size = 20_000
-                chunked_frames = []
-                start_time_general = time.time()
-                for i in range(0, len(payer_ids), chunk_size):
-                    chunk = payer_ids[i:i+chunk_size]
-                    payer_values = '[' + ','.join([f"'{pid}'" for pid in chunk]) + ']'
-                    query = create_query(window_start, window_end, payer_values)
-                    start_time_payers = time.time()
-                    time.sleep(0.5)
-                    part = pd.read_sql(text(query), get_engine())
-                    end_time_payers = time.time()
-                    print(f"Выгузили payers chunk {i//chunk_size+1} ({len(chunk)} ids) - {end_time_payers - start_time_payers}")
-                    if not part.empty:
-                        chunked_frames.append(part)
-                if chunked_frames:
-                    daily_data = pd.concat(chunked_frames, ignore_index=True)
-                    daily_data = (
-                        daily_data
-                        .groupby(['payer_id', 'currency', 'client_name', 'order_type'], as_index=False)
-                        .agg(
-                            total_orders=('total_orders', 'sum'),
-                            success_orders=('success_orders', 'sum'),
-                            amount_success=('amount_success', 'sum'),
-                            banking_details_issued_count=('banking_details_issued_count', 'sum'),
-                            last_order_date=('last_order_date', 'max'),
-                            first_order_date=('first_order_date', 'min'),
-                        )
+
+        chunk_size = 30_000
+        try:
+            print(f"Дата с {window_start} по {window_end}")
+            payer_ids = top_payers['payer_id'].astype(str).tolist()
+            chunked_frames = []
+            start_time_general = time.time()
+            for i in range(0, len(payer_ids), chunk_size):
+                chunk = payer_ids[i:i+chunk_size]
+                print(f"payer_values: {len(chunk)}")
+                payer_values = '[' + ','.join([f"'{pid}'" for pid in chunk]) + ']'
+                query = create_query(window_start, window_end, payer_values)
+                start_time_payers = time.time()
+                time.sleep(0.5)
+                # try:
+                part = read_sql_retry_engine(ENGINE_SRC, query)
+                # except Exception as e:
+                #     log_sql_failure(query, e, chunk_idx=i//chunk_size+1, window_start=window_start, window_end=window_end, limit=10000)
+                #     raise
+                end_time_payers = time.time()
+                print(f"Выгузили payers chunk {i//chunk_size+1} ({len(chunk)} ids) - {end_time_payers - start_time_payers}")
+                print(f"part: {len(part)}")
+                if not part.empty:
+                    chunked_frames.append(part)
+            if chunked_frames:
+                daily_data = pd.concat(chunked_frames, ignore_index=True)
+                print(f"daily_data: {len(daily_data)}")
+                daily_data = (
+                    daily_data
+                    .groupby(['payer_id', 'currency', 'client_name', 'order_type'], as_index=False)
+                    .agg(
+                        total_orders=('total_orders', 'sum'),
+                        success_orders=('success_orders', 'sum'),
+                        amount_success=('amount_success', 'sum'),
+                        banking_details_issued_count=('banking_details_issued_count', 'sum'),
+                        last_order_date=('last_order_date', 'max'),
+                        first_order_date=('first_order_date', 'min'),
                     )
-                else:
-                    daily_data = pd.DataFrame()
-                print(f"Итого daily_data по окну: {len(daily_data)}")
-
-                query_tickets = get_query_tickets(window_start, window_end)
-                start_time_tickets = time.time()
-                tickets_data = pd.read_sql(text(query_tickets), get_engine_tickets())
-                end_time_tickets = time.time()
-                print(f"Выгузили tickets - {end_time_tickets - start_time_tickets}")
-
-                query_get_payers_by_tickets = get_payers_by_tickets(tickets_data['order_id'].tolist())
-                start_time_payers_by_tickets = time.time()
-                payers_by_tickets = pd.read_sql(text(query_get_payers_by_tickets), get_engine())
-                end_time_payers_by_tickets = time.time()
-                print(f"Выгузили payers_by_tickets - {end_time_payers_by_tickets - start_time_payers_by_tickets}")
-
-                tickets_data['order_id'] = tickets_data['order_id'].astype(str)
-                payers_by_tickets['order_id'] = payers_by_tickets['order_id'].astype(str)
-
-                tickets_data = tickets_data.merge(
-                    payers_by_tickets, on='order_id', how='inner'
                 )
-                tickets_data = (
-                    tickets_data.groupby(['payer_id', 'currency', 'order_type', 'client_name'])
-                    .agg(tickets_count=('order_id', 'count'),
-                         count_rejected_tickets=('has_decline_reason', 'sum'))
-                    .reset_index()
-                )
+            else:
+                daily_data = pd.DataFrame()
+            print(f"Итого daily_data по окну: {len(daily_data)}")
 
-                print(f"Размер tickets_data - {len(tickets_data)}")
-                daily_data = daily_data.merge(
-                    tickets_data,
-                    on=['payer_id', 'currency', 'client_name', 'order_type'],
-                    how='left'
-                )
-                print(f"Размер daily_data - {len(daily_data)}")
-                end_time = time.time()
-                print("Выгузили - ", end_time - start_time_general)
-                daily_data = daily_data.merge(top_payers, on='payer_id')
-                if not daily_data.empty:
-                    final_df = pd.concat([final_df, daily_data], ignore_index=True)
-                    print(f"Размер final_df - {len(final_df)}")
-                    print(f"Получено {len(daily_data)} записей")
-                else:
-                    print(f"Нет данных")
-                break
-            except (OperationalError,) as e:
-                attempts += 1
-                if attempts > max_retries:
-                    print(f"Период {window_start}..{window_end}: исчерпаны попытки из-за подключения: {e}")
-                    break
-                sleep_for = backoff_sec * attempts
-                print(f"Ошибка подключения, ретрай {attempts}/{max_retries} через {sleep_for}s: {e}")
-                time.sleep(sleep_for)
-            except Exception as e:
-                print(f"Ошибка при получении данных за {current_date.strftime('%Y-%m-%d')}: {e}")
-                break
+            query_tickets = get_query_tickets(window_start, window_end)
+            start_time_tickets = time.time()
+            tickets_data = read_sql_retry_engine(ENGINE_TICKETS, text(query_tickets))
+            end_time_tickets = time.time()
+            print(f"Выгузили tickets - {end_time_tickets - start_time_tickets}")
 
-        current_date += timedelta(days=5)
-        day_counter += 1
-        time.sleep(0.5)
+            query_get_payers_by_tickets = get_payers_by_tickets(tickets_data['order_id'].tolist())
+            start_time_payers_by_tickets = time.time()
+            payers_by_tickets = read_sql_retry_engine(ENGINE_SRC, text(query_get_payers_by_tickets))
+            end_time_payers_by_tickets = time.time()
+            print(f"Выгузили payers_by_tickets - {end_time_payers_by_tickets - start_time_payers_by_tickets}")
+
+            tickets_data['order_id'] = tickets_data['order_id'].astype(str)
+            payers_by_tickets['order_id'] = payers_by_tickets['order_id'].astype(str)
+
+            tickets_data = tickets_data.merge(
+                payers_by_tickets, on='order_id', how='inner'
+            )
+            tickets_data = (
+                tickets_data.groupby(['payer_id', 'currency', 'order_type', 'client_name'])
+                .agg(tickets_count=('order_id', 'count'),
+                        count_rejected_tickets=('has_decline_reason', 'sum'))
+                .reset_index()
+            )
+
+            print(f"Размер tickets_data - {len(tickets_data)}")
+            daily_data = daily_data.merge(
+                tickets_data,
+                on=['payer_id', 'currency', 'client_name', 'order_type'],
+                how='left'
+            )
+            print(f"Размер daily_data - {len(daily_data)}")
+            end_time = time.time()
+            print("Выгузили - ", end_time - start_time_general)
+            if not daily_data.empty:
+                final_df = pd.concat([final_df, daily_data], ignore_index=True)
+                print(f"Размер final_df - {len(final_df)}")
+                print(f"Получено {len(daily_data)} записей")
+            else:
+                print(f"Нет данных")
+            current_date += timedelta(days=7)
+            day_counter += 1
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка при получении данных за {current_date.strftime('%Y-%m-%d')}: {e}")
+            break
     return final_df
 
 def update_db():
     start_date = datetime(datetime.now().year, 1, 1).strftime('%Y-%m-%d')
+    # start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
     end_date = datetime.now().strftime('%Y-%m-%d')
     data = get_data_by_days(start_date, end_date)
     metrics_success_banking = (
@@ -298,13 +328,14 @@ def update_db():
     metrics_success_banking['conversion_issued'] = (
         metrics_success_banking['banking_details_issued_count'] / metrics_success_banking['total_orders']
     )
-    with get_engine_dwh().begin() as conn:
+    with ENGINE_DWH.begin() as conn:
         conn.execute(text("TRUNCATE TABLE cascade.info_about_payers"))
+    metrics_success_banking = metrics_success_banking[metrics_success_banking['success_orders'] > 0]
     metrics_success_banking.to_sql(
         schema='cascade',
         name='info_about_payers',
         if_exists='append',
-        con=get_engine_dwh(),
+        con=ENGINE_DWH,
         index=False
     )
 

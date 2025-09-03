@@ -2,33 +2,62 @@ import pandas as pd
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+import time
 import IP2Location
 import ipaddress
 
 
+# Shared engines with keepalive/recycle
+SRC_DB_CONFIG = {
+    'host': '138.68.88.175',
+    'port': 5432,
+    'database': 'csd_bi',
+    'user': 'datalens_utl',
+    'password': 'mQnXQaHP6zkOaFdTLRVLx40gT4'
+}
+DWH_DB_CONFIG = {
+    'host': 'primarydwhcsd.aerxd.tech',
+    'port': 6432,
+    'database': 'postgres',
+    'user': 'ste',
+    'password': 'ILzAYQ72aEe9'
+}
 
-def get_engine():
-    db_config = {
-        'host': '138.68.88.175',
-        'port': 5432,
-        'database': 'csd_bi',
-        'user': 'datalens_utl',
-        'password': 'mQnXQaHP6zkOaFdTLRVLx40gT4'
+def _make_engine(db, include_options: bool = True):
+    conn = f"postgresql+psycopg2://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['database']}"
+    connect_args = {
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
     }
+    if include_options:
+        connect_args["options"] = "-c statement_timeout=600000"
+    return create_engine(
+        conn,
+        pool_pre_ping=True,
+        pool_recycle=180,
+        pool_size=5,
+        max_overflow=2,
+        connect_args=connect_args,
+    )
 
-    connection_string = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-    return create_engine(connection_string, pool_pre_ping=True)
+ENGINE_SRC = _make_engine(SRC_DB_CONFIG, include_options=True)
+ENGINE_DWH = _make_engine(DWH_DB_CONFIG, include_options=False)
 
-def get_engine_dwh():
-    db_config = {
-        'host': 'primarydwhcsd.aerxd.tech',
-        'port': 6432,
-        'database': 'postgres',
-        'user': 'ste',
-        'password': 'ILzAYQ72aEe9'
-    }
-    connection_string = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-    return create_engine(connection_string, pool_pre_ping=True)
+
+def read_sql_retry(sql, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            with ENGINE_SRC.connect() as conn:
+                return pd.read_sql(text(sql), conn, params=params)
+        except OperationalError as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+
 
 def update_db():
     start = (datetime.now() - timedelta(days=30)).date()
@@ -41,16 +70,19 @@ def update_db():
     GROUP BY i.payer_id
     HAVING COUNT(*) > 1
     """
-    with get_engine().connect() as conn:
-        data_top_payers = pd.read_sql(text(sql), conn, params={"start_date": start})
+    data_top_payers = read_sql_retry(sql, params={"start_date": start})
     print("Получили лучших пользователей")
-    data_top_payers.to_sql(
-        schema='cascade',
-        name='top_payers',
-        if_exists='replace',
-        con=get_engine_dwh(),
-        index=False
-    )
+    with ENGINE_DWH.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE cascade.top_payers"))
+    with ENGINE_DWH.begin() as conn:
+        data_top_payers.to_sql(
+            schema='cascade',
+            name='top_payers',
+            if_exists='append',
+            con=conn,
+            index=False
+        )
+
 
 update_db()
 

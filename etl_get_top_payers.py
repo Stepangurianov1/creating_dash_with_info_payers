@@ -60,17 +60,17 @@ def read_sql_retry(sql, params=None, retries=3):
 
 
 def update_db():
-    start = (datetime.now() - timedelta(days=30)).date()
-
+    start_general = (datetime.now() - timedelta(days=30)).date()
+    start_last_week = (datetime.now() - timedelta(days=7)).date()
     sql = """
-    SELECT i.payer_id
-    FROM orders.invoice i
-    WHERE i.created_at >= DATE :start_date
-      AND i.status_id = 2
-    GROUP BY i.payer_id
-    HAVING COUNT(*) > 1
+        SELECT i.payer_id
+        FROM orders.invoice i
+        WHERE (i.created_at >= DATE :start_general
+        AND i.status_id = 2) or i.created_at >= DATE :start_last_week
+        GROUP BY i.payer_id
+        HAVING COUNT(*) >= 1
     """
-    data_top_payers = read_sql_retry(sql, params={"start_date": start})
+    data_top_payers = read_sql_retry(sql, params={"start_general": start_general, "start_last_week": start_last_week})
     print("Получили лучших пользователей")
     with ENGINE_DWH.begin() as conn:
         conn.execute(text("TRUNCATE TABLE cascade.top_payers"))
